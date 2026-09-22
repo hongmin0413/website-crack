@@ -1,0 +1,14 @@
+# Claude Code local/machine-specific settings (permissions etc.), not meant to be shared
+.claude/settings.local.json
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+
+# Node (in case any script gets run with dependencies installed locally)
+node_modules/
