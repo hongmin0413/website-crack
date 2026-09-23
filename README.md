@@ -12,3 +12,4 @@
 | 2048 | https://ychung1998.github.io/game-2048/ | [2048/攻略.md](./2048/攻略.md) | [.claude/2048/notes.md](./.claude/2048/notes.md) |
 | 推撲克、push poker、雙人推撲克 | https://poker-push.yicheng-self.workers.dev/ | [push-poker/攻略.md](./push-poker/攻略.md) | [.claude/push-poker/notes.md](./.claude/push-poker/notes.md) |
 | 睡沙發、今晚睡沙發、情侶求生欲測驗、sleep on the couch、無盡地獄 | https://sleep-on-the-couch.lol/ | [sleep-on-the-couch/攻略.md](./sleep-on-the-couch/攻略.md) | [.claude/sleep-on-the-couch/notes.md](./.claude/sleep-on-the-couch/notes.md) |
+| 他又睡著了、直男測驗、無聊指數、sleep on the couch bf、無盡敷衍 | https://sleep-on-the-couch.lol/bf | [fell-asleep-again/攻略.md](./fell-asleep-again/攻略.md) | [.claude/fell-asleep-again/notes.md](./.claude/fell-asleep-again/notes.md) |
