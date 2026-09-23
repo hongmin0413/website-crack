@@ -23,10 +23,7 @@
   const DIRS = ['up', 'down', 'left', 'right'];
   const KEY_OF = { up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight' };
 
-  // ---- Turbo 動畫：把全站 transition/animation 時長壓到接近 0 ----
-  // 純視覺效果，讀盤正確性不依賴它（讀盤是等 DOM 穩定，見下方 waitForBoardSettle）。
-  // 刻意設 0.01s 而不是 0s：CSS Transitions 規格對 duration:0 不保證觸發
-  // transitionend，遊戲若拿這個事件排程下一步，設 0 反而可能卡住。
+  // 純視覺效果，讀盤不依賴它；0.01s 而非 0s 是刻意的，CSS duration:0 不保證觸發 transitionend
   if (FAST_ANIMATIONS && !document.getElementById('__2048_bot_turbo_style')) {
     const style = document.createElement('style');
     style.id = '__2048_bot_turbo_style';
@@ -45,23 +42,9 @@
     document.dispatchEvent(new KeyboardEvent('keydown', { key: KEY_OF[dir], bubbles: true, cancelable: true }));
   }
 
-  // ---- 讀盤等待：先等過網站自己的落子延遲，再等盤面真正穩定 ----
-  // 讀 script.js 原始碼發現：這個網站的按鍵處理是「立刻把現有方塊滑到最終位置
-  // （同步設定 style.left/top），但真正套用結果（含新方塊生成、加分）是透過
-  // `setTimeout(() => applyAnimResult(...), SLIDE_MS)` 延後執行的，SLIDE_MS 是
-  // 網站寫死的常數 = 90（跟我們壓縮的 CSS 動畫時長無關，改 CSS 不會讓它變快）。
-  // 也就是說按下方向鍵之後，現有方塊的位置會立刻更新，但新方塊要等 90ms 後才會
-  // 出現在 DOM 裡。如果只靠「連續兩個影格沒變化」判斷穩定，在那 90ms 補上新方塊
-  // 之前，畫面很可能已經連續兩影格沒變化了（因為位置已經是同步設好的最終值），
-  // 會被誤判成「穩定」，讀到一個少一顆方塊的舊盤面——這正是搜尋變快之後才會踩到
-  // 的雷：以前單步要 ~130ms，天然蓋過這 90ms；現在單步只要 ~25ms，常常搶在 90ms
-  // 之前就讀盤，導致盤面失真、分數崩掉。修法是先強制等滿 MIN_SETTLE_FLOOR_MS
-  // （90 加一點安全邊際）才開始用訊號穩定判斷，兩者都滿足才真正回傳。
-  // 用 setTimeout 而不是 requestAnimationFrame 來輪詢：分頁被瀏覽器排到背景時，
-  // Chrome 會直接暫停 rAF（完全不觸發，不是變慢），實測背景分頁裡 `await
-  // requestAnimationFrame` 可以卡住超過 3 秒都不resolve；setTimeout 在背景分頁
-  // 只會被節流（大約每秒 1 次），變慢但不會整個卡死。這是舊版（固定 sleep）能在
-  // 背景跑、改成 rAF 輪詢後卻不能的原因——舊版從來不依賴 rAF。
+  // 網站按鍵後現有方塊位置同步更新，但新方塊要等 SLIDE_MS=90 後才進 DOM（見 notes.md），
+  // 所以先強制等滿 MIN_SETTLE_FLOOR_MS 才開始判斷穩定，避免讀到少一顆方塊的舊盤面。
+  // 用 setTimeout 輪詢而非 requestAnimationFrame：背景分頁 rAF 會完全暫停，setTimeout 只會被節流
   const MIN_SETTLE_FLOOR_MS = 110;
   const POLL_INTERVAL_MS = 16; // 前景時約等同一個影格，背景時會被節流變慢但仍會醒
   const SETTLE_STABLE_FRAMES = 2;
@@ -94,9 +77,7 @@
     window.__2048BotLastSettleMs = performance.now() - start;
   }
 
-  // ---- 讀盤：從 .tile 的 dataset.v + style.left/top 反推 4x4 board ----
-  // 盤面統一用長度 16 的 Int32Array 表示（index = r*4+c），不再用巢狀陣列——
-  // 單一表示法貫穿讀盤/模擬/評分，少一層轉換，也是 Turbo 引擎的一部分。
+  // 從 .tile 的 dataset.v + style.left/top 反推 4x4 board；盤面統一用長度 16 的 Int32Array（index = r*4+c）
   function readBoard() {
     const boardEl = document.getElementById('board');
     const padding = 10, gap = 10;
@@ -112,28 +93,21 @@
       const v = parseInt(t.dataset.v, 10);
       if (r >= 0 && r < 4 && c >= 0 && c < 4) {
         const i = r * 4 + c;
-        flat[i] = Math.max(flat[i], v); // 動畫交界時可能有殘影，取較大值保險
+        flat[i] = Math.max(flat[i], v); // 動畫交界殘影，取較大值保險
       }
     });
     return flat;
   }
 
-  // ---- 零記憶體配置滑動核心：LINES 表 + 共用 scratch，不再 transpose/reverse/filter ----
-  // 每個方向的 4 條「線」，數值以線上的走訪順序（index 0 = 該線最靠近目的地那端）
-  // 列出對應的 flat index。例如 left 的第一條線是第 0 列，走訪順序就是 0,1,2,3
-  // （原本就是往左靠的順序）；right 的第一條線一樣是第 0 列，但走訪順序反過來
-  // （3,2,1,0），因為要往右靠。
+  // 每個方向 4 條「線」，index 0 = 該線最靠近目的地那端（right/down 走訪順序反過來）
   const LINES = {
     left:  [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11], [12, 13, 14, 15]],
     right: [[3, 2, 1, 0], [7, 6, 5, 4], [11, 10, 9, 8], [15, 14, 13, 12]],
     up:    [[0, 4, 8, 12], [1, 5, 9, 13], [2, 6, 10, 14], [3, 7, 11, 15]],
     down:  [[12, 8, 4, 0], [13, 9, 5, 1], [14, 10, 6, 2], [15, 11, 7, 3]],
   };
-  const slideScratch = new Int32Array(4); // 每條線最多 4 格，重複使用同一塊緩衝
-  // slideInto() 把結果寫進呼叫端給的 out，回傳有沒有真的移動——搜尋樹用共用
-  // 暫存盤面呼叫它，整棵樹跑下來一次記憶體配置都不需要（見下方 poolBoard()）。
-  // 合併得分放在 lastGained，避免為了回傳兩個值而配置物件。
-  let lastGained = 0;
+  const slideScratch = new Int32Array(4);
+  let lastGained = 0; // 合併得分放這裡，避免為了回傳兩個值配置物件
   function slideInto(flat, dir, out) {
     const lines = LINES[dir];
     let moved = false;
@@ -162,15 +136,12 @@
     lastGained = gained;
     return moved;
   }
-  // 會配置新陣列的包裝版，給搜尋樹以外的呼叫端用（搜尋熱路徑一律用 slideInto）。
   function simulateMove(flat, dir) {
     const out = new Int32Array(16);
     const moved = slideInto(flat, dir, out);
     return { board: out, moved, gained: lastGained };
   }
-  // ---- 蛇形路徑（角落 + 名次由高到低排到尾巴），全部以 flat index 表示 ----
-  // 只留 4 種旋轉（每個角落剛好對應一種走法），不加鏡射——鏡射會讓同一個角落
-  // 有兩種走法互搶，分數在兩者間抖動，盤面看起來亂跳。
+  // 蛇形路徑，只留 4 種旋轉（每個角落一種走法），不加鏡射避免同角落兩種走法互搶
   const SNAKE_RANKS_2D = [
     [15, 14, 13, 12],
     [8, 9, 10, 11],
@@ -191,8 +162,7 @@
     let m = SNAKE_RANKS_2D;
     for (let i = 0; i < 4; i++) { SNAKE_VARIANTS.push(flatten2D(m)); m = rotateMatrix2D(m); }
   })();
-  // 把權重矩陣轉成「名次由高到低」的 flat index 清單：order[0] 是角落（頭），
-  // order[15] 是蛇形終點（尾巴最末端）。
+  // order[0] 是角落（頭），order[15] 是蛇形終點（尾巴）
   function buildOrder(wm) {
     const order = [];
     for (let rank = 15; rank >= 0; rank--) {
@@ -202,19 +172,13 @@
   }
   const SNAKE_ORDERS = SNAKE_VARIANTS.map(buildOrder);
 
-  // 用「原始數值」而不是 log2：512 放錯地方的代價是 4 放錯地方的 128 倍，大數字
-  // 自然極度不想亂動、小數字亂放幾乎不影響分數。門檻設在 32（而不是 128）是
-  // 因為 32、64 這種中段數字重複散置也會浪費格子，一樣要維持蛇形，見下方
-  // evaluate() 裡的門檻設定。
   const BIG_TILE_THRESHOLD = 32;
   const BIG_TILE_MULTIPLIER = 4;
   function weightedValue(v) {
     return v >= BIG_TILE_THRESHOLD ? v * BIG_TILE_MULTIPLIER : v;
   }
 
-  // 玩家本人明確講：「固定在某一個角落後就不動了」——不是「每次都重新挑最像
-  // 哪個角落」，是選定一個之後整局都不再換。開局第一次呼叫時挑一次（用當下
-  // 盤面找最貼合的角落），之後整局鎖死，直到下一局重新開始才重選。
+  // 角落選定後整局鎖死不換（玩家本人的固定技巧，見攻略.md），下一局重新開始才重選
   let cornerLocked = false;
   let activeIdx = 0;
   let activeOrder = SNAKE_ORDERS[0];
@@ -242,36 +206,15 @@
     return score;
   }
 
-  // ---- 顧尾巴 + 抓異常：直接對應玩家本人講的判斷順序 ----
-  // TAIL_SIZE：蛇形路徑最後幾格算「尾巴」，這是每一步真正該盯著看的地方
-  // （新方塊從這裡進來）。中間（頭跟尾巴之間，index 1 ~ 15-TAIL_SIZE）算「身體」，
-  // 身體排好之後基本上不用再管，除非出現異常。
+  // 蛇形路徑最後 TAIL_SIZE 格算尾巴，其餘（除了頭）算身體；技巧細節見攻略.md
   const TAIL_SIZE = 6;
-
-  // 異常判定：沿蛇形路徑，名次越靠近頭（index 越小）應該數值越大（>=）。如果
-  // 身體裡某一格（index i）的數值反而比它前一格（更靠近頭，index i-1）大，
-  // 代表 index i-1 那格「應該大卻很小」——這就是玩家講的「頭尾中間有異常的小
-  // 數字」。這裡不是「跟上一步比較」的 transition 規則，是每次都對當下盤面
-  // 直接算違反了多少，讓 expectimax 自己去找「哪個方向能把這個異常合併養大、
-  // 讓違反變小」，不需要另外寫一條「偵測到異常就特別加分」的特例規則。
   const ANOMALY_PENALTY_WEIGHT = 6;
-
-  // 尾巴品質：空格數（有沒有位置收新方塊）+ 相鄰同數值的對數（隨時能合併，
-  // 不會讓尾巴塞滿卡死）。這兩項只算在尾巴範圍內，才是真正對應「只在意尾巴」
-  // ——身體/頭的品質已經由 snakeValue()（鎖定角落的權重矩陣算分）顧到了，
-  // 不需要在這裡重複算。
   const TAIL_EMPTY_WEIGHT = 4;
   const TAIL_MERGE_READY_BONUS = 6;
-  // 身體（頭尾中間）如果出現異常小數字，玩家本人講「就努力把它變大」——只有
-  // 「異常存在就扣分」還不夠，扣分只代表「不喜歡」，不代表「主動去合併掉」；
-  // 加一項「身體裡只要有相鄰兩格同數值就加分」，明確鼓勵 expectimax 選會把
-  // 異常合併掉的方向，而不是放著扣分但沒有動力處理。
   const BODY_MERGE_READY_BONUS = 10;
+  const EMPTY_WEIGHT = 8;
 
-  const EMPTY_WEIGHT = 8; // 全盤空格數，沿用先前驗證過的權重
-
-  // 身體異常扣分——抽成獨立函式，evaluate() 跟 isBodyClean() 共用同一套計算，
-  // 不要各寫一份，避免以後改一邊忘了改另一邊。
+  // evaluate() 跟 isBodyClean() 共用，避免各寫一份、以後改一邊忘了改另一邊
   function bodyAnomalyPenalty(flat) {
     const order = activeOrder;
     const tailStart = 16 - TAIL_SIZE;
@@ -283,11 +226,7 @@
     }
     return penalty;
   }
-  // 「身體乾淨」判定，給重骰用。門檻不能設 0：小數字（2、4、8 這種）暫時卡在
-  // 該大卻小的位置，是每一步都會自然發生、很快就會被合併掉的正常波動，不是
-  // 玩家講的「異常」，設 0 會變成幾乎每一步都在悔棋，跟「不用這麼常悔棋」的
-  // 要求相反。只有落差大到真的像「128 卡在該放 1024 的位置」這種等級，才算
-  // 弄髒，才值得賭下一次隨機生成能避開。
+  // 門檻不能設 0：小數字暫時卡位是每步都會發生的正常波動，設 0 會變成幾乎每步都悔棋
   const BODY_DIRTY_THRESHOLD = 32;
   function isBodyClean(flat) {
     return bodyAnomalyPenalty(flat) <= BODY_DIRTY_THRESHOLD;
@@ -302,9 +241,6 @@
     for (let i = tailStart; i < 16; i++) {
       if (flat[order[i]] === 0) tailBonus += TAIL_EMPTY_WEIGHT;
     }
-    // 合併就緒獎勵：尾巴用 TAIL_MERGE_READY_BONUS，身體（頭尾中間）用
-    // BODY_MERGE_READY_BONUS——身體出現異常小數字時，這裡會直接獎勵「把它
-    // 合併掉」的方向，不是只靠 anomalyPenalty 被動扣分。
     for (let i = 0; i < 15; i++) {
       if (flat[order[i]] !== 0 && flat[order[i]] === flat[order[i + 1]]) {
         tailBonus += (i >= tailStart) ? TAIL_MERGE_READY_BONUS : BODY_MERGE_READY_BONUS;
@@ -335,14 +271,9 @@
     }
     return h >>> 0;
   }
-  // 快取容器：依 (剩餘深度 << 1 | 是否玩家回合) 分槽，每槽是 Map<lo, Map<hi, 分數>>。
-  function newCache() { return []; }
+  function newCache() { return []; } // 依 (剩餘深度 << 1 | 是否玩家回合) 分槽，每槽 Map<lo, Map<hi, 分數>>
 
-  // ---- 每層專用暫存：讓整棵搜尋樹不需要任何記憶體配置 ----
-  // 每一層搜尋深度各有一組暫存（盤面 / 空格清單 / criticality 分數），同一層的
-  // 各個分支輪流覆寫它。安全性來自「每個節點只寫自己這層的暫存、只讀上一層寫給
-  // 它的那塊」：子節點的剩餘深度一定比父節點小 1，所以子樹永遠不會動到父節點正在
-  // 讀的那塊。
+  // 每層深度各自的暫存（盤面/空格/criticality），子節點深度必小 1，子樹不會動到父節點正在讀的那塊
   const boardPool = [];
   const cellsPool = [];
   const critPool = [];
@@ -362,12 +293,7 @@
     return b;
   }
 
-  // ---- 深層分支機率剪枝：空格數 > PRUNE_EMPTY_THRESHOLD 時，只對「最貼近現有
-  // 方塊」的 PRUNE_KEEP 個空格完整展開 2/4 兩種分支，其餘空格只展開機率占多數
-  // 的 2（跳過 4）——那些格子離主戰場遠，10% 的 4 對整體評分影響很小，犧牲這點
-  // 精度換取節點數大幅減少。criticality 用「四個方向的已有方塊加權值之和」衡量
-  // 「這格離現有大數字有多近」，不是隨便挑，貼近大數字的空格才是真正會影響
-  // 下一步合併判斷的地方。 ----
+  // 空格數 > PRUNE_EMPTY_THRESHOLD 時，只對 criticality 最高的 PRUNE_KEEP 個空格展開 2/4 兩種分支，其餘只展開 2
   const PRUNE_EMPTY_THRESHOLD = 6;
   const PRUNE_KEEP = 6;
   function criticality(flat, i) {
@@ -380,8 +306,6 @@
     return score;
   }
 
-  // ---- expectimax：玩家層取 4 個方向中分數最高者，機率層對每個空格的 2/4 取
-  // 期望值（貼近戰場的空格）或只取 2（遠離戰場、被剪枝的空格）----
   function search(flat, depth, isPlayerTurn, cache) {
     if (depth === 0) return evaluate(flat);
 
@@ -419,9 +343,7 @@
       } else {
         let nCritical = nCells;
         if (nCells > PRUNE_EMPTY_THRESHOLD) {
-          // 依 criticality 由大到小排序，前 PRUNE_KEEP 個完整展開 2/4，其餘只展開 2。
-          // 用插入排序就地排（最多 16 個元素），不配置任何暫存陣列；「相等時不往前移」
-          // 是穩定排序，同分時維持格號由小到大的原順序。
+          // 插入排序就地排（最多 16 個元素），不配置暫存陣列，穩定排序保持同分原順序
           const crit = poolCrit(depth);
           for (let k = 0; k < nCells; k++) crit[k] = criticality(flat, cells[k]);
           for (let k = 1; k < nCells; k++) {
@@ -441,7 +363,6 @@
           total += 0.1 * search(child, depth - 1, true, cache);
         }
         for (let k = nCritical; k < nCells; k++) {
-          // 剪枝：遠離戰場的空格只展開機率占多數的 2，跳過 4，用來換取節點數減少。
           const i = cells[k];
           child.set(flat); child[i] = 2;
           total += search(child, depth - 1, true, cache);
@@ -458,29 +379,15 @@
     return result;
   }
 
-  // iterative deepening + 保證最小深度：depth < MIN_GUARANTEED_DEPTH 時完全不看
-  // 時間，一定先跑完才考慮要不要停；depth > MIN_GUARANTEED_DEPTH 時，開始下一輪
-  // 之前先用「上一輪耗時 x GROWTH_ESTIMATE」預測這一輪大概要多久，預測會爆預算就
-  // 不跑，避免深層搜尋暴衝拖慢單步時間（一輪跑完才檢查時間不夠，同一輪內部自己
-  // 就可能暴增）。
-  //
-  // 預算設低（實測結論，見 2048/攻略.md 6.5 節）：分數對深度在深度 5 之後就飽和，
-  // 搜到 6 層已經買到全部棋力，再深純粹燒 CPU；2048 的高分 = 單局品質 × 試了幾局，
-  // 品質飽和後，剩下的槓桿是「同樣時間多跑幾局」，所以預算砍到剛好穩住深度 6。
-  const SEARCH_TIME_BUDGET_MS = 25; // 每一步的時間預算；調大不會更強（深度 5 以後分數已飽和），只會更慢
-  // 盤面上已經有大異常（例如該放最大值的位置卻卡著小很多的數字）時，多花點
-  // 時間往下想——悔棋只能救「這一步剛弄髒」的情況，已經卡著一段時間的異常
-  // 悔棋不會管，只能靠搜尋看遠一點，找有沒有辦法趁機會把它救回來、或至少不要
-  // 讓情況更糟。門檻沿用 BODY_DIRTY_THRESHOLD，跟悔棋判定「多大算異常」一致。
-  const EXTENDED_SEARCH_TIME_BUDGET_MS = 60;
-  const MAX_SEARCH_DEPTH = 9; // 安全上限，避免空格很少時每層太便宜、沒完沒了地往下挖
-  // 硬性深度保證：這個深度以下完全不檢查時間，也不做成長預測，確保就算遇到特別貴
-  // 的盤面也一定會把飽和點（深度 5）以上的那一層算完。
-  const MIN_GUARANTEED_DEPTH = 6;
-  const GROWTH_ESTIMATE = 4; // 保守估計「深度 +1」耗時會乘上幾倍，用來預判下一輪值不值得跑
-  let lastSearchDepth = 0; // 最近一步實際搜到的深度（見 bestMove 結尾）
+  // 預算刻意設低：分數對深度在深度 5 後就飽和（見 notes.md），深度 6 已買到全部棋力
+  const SEARCH_TIME_BUDGET_MS = 25;
+  const EXTENDED_SEARCH_TIME_BUDGET_MS = 60; // 盤面已有大異常時延長，悔棋救不了舊異常，只能靠搜尋看遠一點
+  const MAX_SEARCH_DEPTH = 9;
+  const MIN_GUARANTEED_DEPTH = 6; // 這個深度以下不檢查時間，確保飽和點以上那層一定算完
+  const GROWTH_ESTIMATE = 4;
+  let lastSearchDepth = 0;
   function bestMove(flat) {
-    updateActiveCorner(flat); // 只在還沒鎖定時挑一次，鎖定後這局都不再重選
+    updateActiveCorner(flat);
     const searchBudget = bodyAnomalyPenalty(flat) > BODY_DIRTY_THRESHOLD
       ? EXTENDED_SEARCH_TIME_BUDGET_MS
       : SEARCH_TIME_BUDGET_MS;
@@ -489,10 +396,7 @@
     let best = null;
     let lastRoundMs = 0;
     let reachedDepth = 0;
-    // 快取在同一次 bestMove 的各輪 iterative deepening 之間共用：鍵值本身就含
-    // 「剩餘深度」與「輪到誰」，而 (盤面, 剩餘深度, 回合) 三者就唯一決定該節點的
-    // 值，所以深一輪可以直接命中淺一輪算過的子樹。
-    const cache = newCache();
+    const cache = newCache(); // 各輪 iterative deepening 共用，鍵值含剩餘深度與回合，深一輪能命中淺一輪算過的子樹
     for (let depth = 2; depth <= MAX_SEARCH_DEPTH; depth++) {
       if (depth > MIN_GUARANTEED_DEPTH) {
         const predicted = lastRoundMs * GROWTH_ESTIMATE;
@@ -512,9 +416,6 @@
       if (localBest) { best = localBest; reachedDepth = depth; } // 這一輪四個方向都公平算完了，才採用
       if (depth >= MIN_GUARANTEED_DEPTH && performance.now() > deadline) break;
     }
-    // 這一步實際跑完的最深一輪。搜尋速度變快的好處就是同樣的時間預算能跑到更深，
-    // 所以直接把它記錄下來（window.__2048BotLastDepth）可以隨時確認現在到底
-    // 搜到第幾層，不用憑感覺猜。
     lastSearchDepth = reachedDepth;
     window.__2048BotLastDepth = reachedDepth;
     return best;
@@ -540,8 +441,6 @@
     return parseInt(document.getElementById('score').textContent, 10) || 0;
   }
 
-  // 盤面上最大跟第二大的方塊數值（不是去重後的名次，是實際數值排序前兩名，
-  // 如果剛好有兩顆一樣大的方塊，最大跟第二大會顯示同一個數字，這是正確的）。
   function topTwoTiles(flat) {
     const vals = Array.from(flat).filter((v) => v > 0).sort((a, b) => b - a);
     return { max: vals[0] || 0, second: vals[1] || 0 };
@@ -565,8 +464,6 @@
           await waitForBoardSettle();
           continue;
         }
-        // 這一局輸了，但還沒到目標分數：每一局都是獨立的隨機試驗，運氣差提前死掉
-        // 不代表方法錯，所以不整個停掉，改成自動重開再試一次（累計最佳紀錄）。
         const finalScore = currentScore();
         const { max: maxTile, second: secondTile } = topTwoTiles(readBoard());
         window.__2048BotAttempts++;
@@ -582,22 +479,9 @@
       }
       const board = readBoard();
       const dir = bestMove(board);
-      if (!dir) { await nextFrame(); continue; } // 理論上不該發生（canMove 為 false 時應該已顯示 overlay），沒有盤面變化，等一影格重新判斷即可
+      if (!dir) { await nextFrame(); continue; }
 
-      // 悔棋（重骰）的時機：玩家本人一開始講「不用這麼常悔棋，只有在被迫離開、
-      // 原本角落被擋住才悔」「尾巴被其它小數字擋住時也可以悔棋」，後來玩家本人
-      // 把這條規則收窄成只剩一種情況——只有「蛇形從正常變異常」才悔棋重骰：這步
-      // 之前身體是乾淨的（沒有異常小數字），這步卻被迫產生異常，才值得賭下一次
-      // 隨機生成能避開——見 isBodyClean/bodyAnomalyPenalty。已經存在的舊異常不
-      // 重骰，重骰救不了它、只會浪費重骰次數。角落被擋、尾巴卡死這兩種舊觸發
-      // 條件已經拿掉，不再悔棋。
-      //
-      // 這招只能救「剛抽到的爛運氣」，救不了已成定局的死盤：網站自己的邏輯在
-      // 「真的無路可走」或「第一次湊到 2048」那一瞬間就會把悔棋鎖死
-      // （script.js 對應那兩處都寫死 prevSnapshot = null，並附註「遊戲已明確結束，
-      // 不可再悔棋」「紀錄已定案，禁止悔棋改變已記錄的結果」），所以 isUndoEnabled()
-      // 到那時一定是 false，下面的迴圈會自然跳過、不會硬悔——這是刻意的邊界，
-      // 不是漏掉沒處理。
+      // 只有「這步之前身體乾淨、這步卻被迫產生異常」才悔棋重骰，技巧細節見攻略.md
       const wasBodyCleanBeforeMove = isBodyClean(board);
       fireArrow(dir);
       window.__2048BotMoves++;
@@ -620,12 +504,6 @@
     window.__2048BotRunning = false;
   }
 
-  // 手動打 window.__2048BotStop = true 只會讓迴圈跑完當下這一步就結束，並不會
-  // 清掉盤面或關閉分頁——遊戲本身（board/score）還在，只是沒有腳本繼續按鍵而已。
-  // 同一個分頁、同一次貼上腳本的 Console session 裡，之後想接著玩，
-  // 打 window.__2048BotResume() 就會從目前盤面繼續，不用重貼整份腳本。
-  // （如果分頁重整過或整個關掉重開，這個 closure 就消失了，那就得重新貼一次腳本，
-  // 但那也只是重新啟動腳本，遊戲本身的最高分紀錄還是讀 localStorage，不會不見。）
   window.__2048BotResume = function () {
     if (window.__2048BotRunning) {
       console.log('2048 bot: 現在就在跑了，不用重複啟動');

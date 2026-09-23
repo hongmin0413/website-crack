@@ -176,10 +176,7 @@
       const discWeight = empties <= 12 ? 2.0 : 0.1;
       return pos + mobility * 1.5 + discDiff * discWeight;
     }
-    // minimax 內部用 WEIGHTS 對候選手排序純粹是為了加速 alpha-beta 剪枝：只影響探索
-    // 順序，minimax 回傳的數值本身跟順序無關（min/max 是集合運算），所以不會改變
-    // aiMove 最終選到的那一手——aiMove 自己的最外層仍照 legalMovesOn 原始（row-major）
-    // 順序遍歷，同分 tie-break 因此跟真引擎保持一致。
+    // 排序只加速 alpha-beta 剪枝，不影響 minimax 回傳值；aiMove 外層仍照原始順序遍歷保持 tie-break 一致
     function minimax(board, depth, alpha, beta, toMove, aiColor) {
       const [Plo, Phi, Olo, Ohi] = POof(board, toMove);
       const [mvLo, mvHi] = generateMoves(Plo, Phi, Olo, Ohi);
@@ -283,13 +280,7 @@
       }
       return { board, current: res.current, winner: res.winner, whiteMoves };
     }
-    // 候選排序只影響 DFS 先試哪一手（不影響正確性），但直接決定要翻多少節點才撞到
-    // 必勝解。三項都是實測選出來的（見 攻略.md「搜尋候選排序」）：
-    // - 位置權重：角落/邊優先，沿用評分表。
-    // - 減白方機動力（whiteOpts）：白方是決定性函式，選項越少越容易被逼進死路，
-    //   這項的貢獻最大。
-    // - 減翻子數：早期少翻子（安靜手）保持自己的邊界小，是黑白棋通則；原本的排序
-    //   反而獎勵翻多子，方向是相反的。
+    // 候選排序只影響 DFS 先試哪一手，直接決定要翻多少節點才撞到必勝解，細節見攻略.md
     function rankBlackMoves(board) {
       const moves = legalMovesOn(board, BLACK);
       return moves.map(([r, c]) => {
@@ -311,10 +302,7 @@
     return out;
   }
 
-  // settleToBlack()（白方被迫回應那串）是盤面的純函式，而 DFS 不同分支經常走到同一個
-  // 盤面，所以整輪搜尋共用一份快取。實測命中率約 38%，整體搜尋快約 1.5 倍；因為是純
-  // 函式快取，節點數與搜尋結果完全不變（實測前後節點數一模一樣）。回傳物件是共用的，
-  // 呼叫端只讀不改。
+  // settleToBlack 是純函式，DFS 不同分支常走到同一盤面，整輪搜尋共用快取（實測命中率約 38%）
   let settleMemo = new Map();
   const SETTLE_MEMO_MAX = 200000; // 保險上限，避免極端長搜尋把記憶體吃光
   function resetSettleMemo() { settleMemo = new Map(); }

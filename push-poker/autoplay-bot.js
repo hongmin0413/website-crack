@@ -16,17 +16,7 @@ window.pushPokerBot = (function () {
   const grabRarity = { ...rarity, 1: 0 };
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  // 背景分頁也能繼續跑：參考 2048 那份腳本踩過的雷（見 2048/攻略.md）——Chrome
-  // 分頁被切到背景後，rAF 會被直接暫停（完全不觸發），setTimeout 則只是被節流
-  // （沒差幾分鐘大約每分鐘才醒一次），所以這裡從頭到尾都只用 setTimeout，絕對不用
-  // requestAnimationFrame。但光是這樣還不夠：如果每一步都要串好幾個 setTimeout
-  // 才能等到畫面出現變化（例如原本擲骰後用 for 迴圈重試 20 次、等骰到不是我的回合
-  // 又固定 sleep），節流狀態下等於同一步要熬過好幾輪「每分鐘才醒一次」，一步就可能
-  // 卡好幾分鐘，體感上跟完全停掉沒兩樣。改用 MutationObserver 等待條件成立：它是
-  // 「DOM 一有變化就觸發」，不是排程出來的計時器，不吃 Chrome 這套背景計時器節流
-  // 預算，畫面（不管前景背景）一有變化就能立刻醒過來重新檢查條件，只有真的等不到
-  // 變化時才會靠底下這顆保底 setTimeout 逾時放棄。這樣「我方回合是否輪到」「拆法
-  // 選項是否已經出現」都能幾乎即時反應，不會被我們自己的輪詢頻率拖慢。
+  // MutationObserver 等 DOM 變化，不用 setTimeout 輪詢，背景分頁節流時也能立刻醒來（見 notes.md）
   function waitForChange(predicate, maxWaitMs = 15000) {
     return new Promise((resolve) => {
       if (predicate()) { resolve(true); return; }
@@ -51,9 +41,7 @@ window.pushPokerBot = (function () {
     });
   }
 
-  // 破壞動畫：頁面用 CSS transition/animation 做骰子、推牌、燒灼特效（0.2~1.2s 不等），
-  // 純視覺效果，遊戲邏輯不會等動畫播完才更新狀態（沒有 animationend/transitionend 監聽）。
-  // 開局就把所有動畫時間砍到接近 0，之後的 sleep 也才敢跟著縮短，玩起來明顯變快。
+  // 純視覺動畫，遊戲邏輯不等它播完，壓到接近 0 不影響正確性
   function killAnimations() {
     if (document.getElementById('pushpoker-bot-no-anim')) return;
     const style = document.createElement('style');
@@ -76,9 +64,7 @@ window.pushPokerBot = (function () {
     );
   }
 
-  // 從選單畫面自動開局：選難度、按開始對戰、猜拳（隨機出拳，平手會重新出現猜拳按鈕，
-  // 迴圈內判斷到按鈕消失才算分出勝負，自然涵蓋「平手重猜」）。如果呼叫時已經在對局中
-  // （選單/猜拳按鈕都不存在），兩段都會直接跳過，不影響原本從中途接手的用法。
+  // 已在對局中時（選單/猜拳按鈕都不存在）兩段都直接跳過，不影響從中途接手的用法
   async function ensureGameStarted() {
     const diffLabel = CONFIG.difficulty === 'hard' ? '困難' : '簡單';
     const diffBtn = visibleButtons().find((b) => b.textContent.trim() === diffLabel);
@@ -156,8 +142,6 @@ window.pushPokerBot = (function () {
       log.push('rolled');
     }
 
-    // 擲骰後 options 不會馬上出現；用 waitForChange 偵測 DOM 變化，比固定輪詢
-    // 可靠也更省時間，背景分頁時也不會被我們自己的輪詢間隔拖慢（見上面 waitForChange 說明）。
     const visibleOpts = () =>
       Array.from(document.querySelectorAll('button.opt')).filter((b) => b.getClientRects().length > 0);
     await waitForChange(() => !isMyTurn() || visibleOpts().length > 0, 10000);
@@ -172,23 +156,15 @@ window.pushPokerBot = (function () {
         const N = nums.filter((n) => !my.has(n)); // 這個拆法實際會移動的、我還沒有的牌
         const P = N.filter((n) => opp.has(n)); // 其中會把對手的牌推回起點的部分
         let score = N.reduce((s, c) => s + grabRarity[c], 0);
-        // 推回對手的加分要看「推回幾張」：推回 2 張以上是真正的淨牌差優勢（見 2.1 第 3 點
-        // 「拆 1+2+3 一次推回對手 3 張」那個例子），值得用高權重去換；但只推回 1 張時，用同樣
-        // 高的權重會出問題——實測真的發生過「自己的 6 明明還在，卻為了推對手一張普通的牌
-        // 選了拆法放掉 6」。改成 0.5 倍後用窮舉腳本重新驗證，發現「對手剛好有 4 被單獨推回」
-        // 這種情況 0.5 倍還是不夠低，仍會蓋過「直接用 6」；6 是全場唯一入口，比 0.5 倍再降到
-        // 0.35 倍才能在窮舉所有骰值 × 對手推回組合下，穩定保住「直接用 6」不被單張推回打敗。
+        // 推回權重（0.35 / 1.5 倍）跟權重來源見 .claude/push-poker/notes.md，已用窮舉腳本驗證過
         score += P.length >= 2 ? 1.5 * P.reduce((s, c) => s + rarity[c], 0) : 0.35 * P.reduce((s, c) => s + rarity[c], 0);
 
         const myAfter = new Set([...my, ...N]);
         const oppAfter = new Set([...opp].filter((x) => !P.includes(x)));
 
-        if (myAfter.size === 6) score += 1000; // 這步直接獲勝
-        if (opp.size >= 3 && P.length > 0) score += 60 * opp.size * P.length; // 對手快贏了，防守優先
-        // 移動張數只當極小的平手判斷依據，不能蓋過稀有度：舊版用 N.length * my.size * 2，
-        // 局勢越後面權重越誇張，導致寧可折 1+2+3 湊「張數」也不肯單留稀有的 6，等於白白放掉
-        // 全場唯一能拿 6 的機會——這正是「先推大數字、能不推 1 就不推」這條心得對應要修的問題。
-        score += N.length * 0.5;
+        if (myAfter.size === 6) score += 1000;
+        if (opp.size >= 3 && P.length > 0) score += 60 * opp.size * P.length;
+        score += N.length * 0.5; // 只當平手判斷依據，權重刻意極小，不能蓋過稀有度
 
         const low = [1, 2, 3];
         if (low.every((x) => myAfter.has(x)) && !low.some((x) => oppAfter.has(x))) {
