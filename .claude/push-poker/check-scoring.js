@@ -1,5 +1,5 @@
 // 離線窮舉驗證 autoplay-bot.js 的算分邏輯，不用開瀏覽器。
-// 用法：node push-poker/check-scoring.js
+// 用法：node .claude/push-poker/check-scoring.js
 //
 // 針對每個骰子點數，窮舉所有拆法組合、以及對手在相關數字上「有沒有推回可能」跟
 // 「對手總張數」的每一種情境，檢查有沒有「明明有單張大數字選項可選，卻在沒有正當

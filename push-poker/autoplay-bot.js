@@ -16,6 +16,79 @@ window.pushPokerBot = (function () {
   const grabRarity = { ...rarity, 1: 0 };
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+  // ---- 困難模式：從打包後的前端原始碼（assets/index-*.js）逆向出來的官方演算法 ----
+  // 官方困難 AI 不是用上面那套「防守門檻／稀有度加權」的經驗式打法，而是每一步都做一層
+  // expectimax：模擬自己每種拆法之後，再窮舉對手下一擲的 6 種骰值、假設對手也會貪心選出
+  // 對自己最有利的拆法，取期望值最高的選項。這裡完全照搬同一套算法（角色對調），讓我方在
+  // 困難模式也用官方等級的判斷，而不是用經驗式權重硬拚。細節與逆向過程見 notes.md。
+  const HARD_RARITY = { 1: 1.2, 2: 1.5, 3: 1.5, 4: 2, 5: 3, 6: 6 }; // 官方 jt 表：6 / 能移動這張牌的骰法種數
+  const ALL_CARDS = [1, 2, 3, 4, 5, 6];
+  const TERMINAL = 1000;
+  const EPS = 1e-9;
+  const SPLITS_BY_DICE = {};
+  for (const dice of ALL_CARDS) {
+    const combos = [];
+    for (let mask = 1; mask < 64; mask++) {
+      const combo = ALL_CARDS.filter((_, i) => mask & (1 << i));
+      if (combo.reduce((a, b) => a + b, 0) === dice) combos.push(combo);
+    }
+    SPLITS_BY_DICE[dice] = combos;
+  }
+  function legalMovesForDice(center, dice) {
+    const seen = new Set();
+    const out = [];
+    for (const combo of SPLITS_BY_DICE[dice]) {
+      const filtered = combo.filter((v) => !center.has(v));
+      const key = filtered.join('+');
+      if (filtered.length > 0 && !seen.has(key)) {
+        seen.add(key);
+        out.push(filtered);
+      }
+    }
+    return out;
+  }
+  function applyMove(moverCenter, otherCenter, combo) {
+    const newMover = new Set(moverCenter);
+    combo.forEach((v) => newMover.add(v));
+    const newOther = new Set([...otherCenter].filter((v) => !combo.includes(v)));
+    return { newMover, newOther };
+  }
+  function hardScore(myCenter, oppCenter) {
+    const diff =
+      [...myCenter].reduce((s, v) => s + HARD_RARITY[v], 0) -
+      [...oppCenter].reduce((s, v) => s + HARD_RARITY[v], 0);
+    if (myCenter.size === 6) return TERMINAL + diff;
+    if (oppCenter.size === 6) return -TERMINAL + diff;
+    return diff;
+  }
+  // 期望值：窮舉對手下一擲的 6 種骰值，假設對手會貪心選出對自己最有利的拆法
+  function expectedAfterOpponentTurn(myCenter, oppCenter) {
+    let total = 0;
+    for (const face of ALL_CARDS) {
+      const oppMoves = legalMovesForDice(oppCenter, face);
+      if (oppMoves.length === 0) { total += hardScore(myCenter, oppCenter); continue; }
+      let best = -Infinity, bestState = null;
+      for (const combo of oppMoves) {
+        const { newMover: newOpp, newOther: newMine } = applyMove(oppCenter, myCenter, combo);
+        const val = hardScore(newOpp, newMine); // 從對手自己的角度貪心
+        if (val > best) { best = val; bestState = { newOpp, newMine }; }
+      }
+      total += hardScore(bestState.newMine, bestState.newOpp); // 換回我方角度
+    }
+    return total / ALL_CARDS.length;
+  }
+  // 直接吃畫面上解析出來的拆法選項（每個都已經是「還沒進中央的牌」子集），不用另外猜骰值
+  function chooseHardMove(myCenter, oppCenter, moveOptions, rng) {
+    const scores = moveOptions.map((combo) => {
+      const { newMover: newCenter, newOther: newOpp } = applyMove(myCenter, oppCenter, combo);
+      if (newCenter.size === 6) return hardScore(newCenter, newOpp);
+      return expectedAfterOpponentTurn(newCenter, newOpp);
+    });
+    const bestScore = Math.max(...scores);
+    const tied = moveOptions.filter((_, i) => scores[i] > bestScore - EPS);
+    return tied.length === 1 ? tied[0] : tied[Math.floor(rng() * tied.length)];
+  }
+
   // MutationObserver 等 DOM 變化，不用 setTimeout 輪詢，背景分頁節流時也能立刻醒來（見 notes.md）
   function waitForChange(predicate, maxWaitMs = 15000) {
     return new Promise((resolve) => {
@@ -150,33 +223,44 @@ window.pushPokerBot = (function () {
     if (opts.length > 0 && isMyTurn()) {
       ({ my, opp } = getCenter());
       let best = null;
-      let bestScore = -Infinity;
-      for (const o of opts) {
-        const nums = parseOpt(o);
-        const N = nums.filter((n) => !my.has(n)); // 這個拆法實際會移動的、我還沒有的牌
-        const P = N.filter((n) => opp.has(n)); // 其中會把對手的牌推回起點的部分
-        let score = N.reduce((s, c) => s + grabRarity[c], 0);
-        // 推回權重（0.35 / 1.5 倍）跟權重來源見 .claude/push-poker/notes.md，已用窮舉腳本驗證過
-        score += P.length >= 2 ? 1.5 * P.reduce((s, c) => s + rarity[c], 0) : 0.35 * P.reduce((s, c) => s + rarity[c], 0);
 
-        const myAfter = new Set([...my, ...N]);
-        const oppAfter = new Set([...opp].filter((x) => !P.includes(x)));
+      if (CONFIG.difficulty === 'hard') {
+        // 困難模式：直接用逆向出來的官方 AI 演算法（expectimax），角色對調用在自己身上
+        const moveOptions = opts.map(parseOpt);
+        const chosen = chooseHardMove(my, opp, moveOptions, Math.random);
+        const key = chosen.slice().sort().join('+');
+        best = opts.find((o) => parseOpt(o).slice().sort().join('+') === key) || opts[0];
+        log.push('picked(hard-engine): ' + best.textContent.trim());
+      } else {
+        // 簡單模式：電腦本身是隨機選拆法，沿用原本的經驗式權重就已經穩贏，不用上重演算法
+        let bestScore = -Infinity;
+        for (const o of opts) {
+          const nums = parseOpt(o);
+          const N = nums.filter((n) => !my.has(n)); // 這個拆法實際會移動的、我還沒有的牌
+          const P = N.filter((n) => opp.has(n)); // 其中會把對手的牌推回起點的部分
+          let score = N.reduce((s, c) => s + grabRarity[c], 0);
+          // 推回權重（0.35 / 1.5 倍）跟權重來源見 .claude/push-poker/notes.md，已用窮舉腳本驗證過
+          score += P.length >= 2 ? 1.5 * P.reduce((s, c) => s + rarity[c], 0) : 0.35 * P.reduce((s, c) => s + rarity[c], 0);
 
-        if (myAfter.size === 6) score += 1000;
-        if (opp.size >= 3 && P.length > 0) score += 60 * opp.size * P.length;
-        score += N.length * 0.5; // 只當平手判斷依據，權重刻意極小，不能蓋過稀有度
+          const myAfter = new Set([...my, ...N]);
+          const oppAfter = new Set([...opp].filter((x) => !P.includes(x)));
 
-        const low = [1, 2, 3];
-        if (low.every((x) => myAfter.has(x)) && !low.some((x) => oppAfter.has(x))) {
-          score -= 6; // 同時集滿 1+2+3 卻沒碰對手，會暴露在對手一次「6=1+2+3」團滅的風險下
+          if (myAfter.size === 6) score += 1000;
+          if (opp.size >= 3 && P.length > 0) score += 60 * opp.size * P.length;
+          score += N.length * 0.5; // 只當平手判斷依據，權重刻意極小，不能蓋過稀有度
+
+          const low = [1, 2, 3];
+          if (low.every((x) => myAfter.has(x)) && !low.some((x) => oppAfter.has(x))) {
+            score -= 6; // 同時集滿 1+2+3 卻沒碰對手，會暴露在對手一次「6=1+2+3」團滅的風險下
+          }
+
+          if (score > bestScore) {
+            bestScore = score;
+            best = o;
+          }
         }
-
-        if (score > bestScore) {
-          bestScore = score;
-          best = o;
-        }
+        log.push('picked: ' + best.textContent.trim() + ' score=' + bestScore.toFixed(1));
       }
-      log.push('picked: ' + best.textContent.trim() + ' score=' + bestScore.toFixed(1));
       best.click();
       await sleep(200);
     } else if (rollBtn) {
